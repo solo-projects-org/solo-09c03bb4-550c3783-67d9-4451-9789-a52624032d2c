@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wafers (
@@ -75,6 +75,43 @@ CREATE TABLE IF NOT EXISTS map_cells (
     source_local_col     INTEGER NOT NULL,
     computed_seq         INTEGER NOT NULL,
     PRIMARY KEY (wafer_id, full_row, full_col)
+);
+
+-- Retest-chain QC.  One row per submitted checklist.  ``revision`` is a
+-- per-wafer counter: resubmitting the checklist advances it, which is what
+-- invalidates the previous release.  A conclusion is only valid while
+-- (revision, obs_seq, map_seq) still match the wafer's live counters, so
+-- acceptance of new measurements invalidates a release without touching
+-- this table.
+CREATE TABLE IF NOT EXISTS qc_checks (
+    check_id      TEXT PRIMARY KEY,
+    wafer_id      TEXT NOT NULL REFERENCES wafers(wafer_id),
+    revision      INTEGER NOT NULL,
+    status        TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'superseded')),
+    item_count    INTEGER NOT NULL,
+    conclusion    TEXT CHECK (conclusion IN ('releasable', 'not_releasable')),
+    findings      TEXT,
+    summary       TEXT,
+    obs_seq       INTEGER,
+    map_seq       INTEGER,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    last_error_at TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    completed_at  TEXT,
+    UNIQUE (wafer_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_qc_checks_wafer_revision
+    ON qc_checks (wafer_id, revision);
+
+CREATE TABLE IF NOT EXISTS qc_check_items (
+    check_id               TEXT NOT NULL REFERENCES qc_checks(check_id),
+    full_row               INTEGER NOT NULL,
+    full_col               INTEGER NOT NULL,
+    expected_max_retest_no INTEGER NOT NULL,
+    PRIMARY KEY (check_id, full_row, full_col)
 );
 """
 

@@ -1,12 +1,13 @@
 services:
   wafer-api:
     build: .
-    image: wafer-probe-map:1.0.0
+    image: wafer-probe-map:1.1.0
     ports:
       - "8000:8000"
     environment:
       WAFER_DB_PATH: /data/wafer.db
       SCHEDULER_WORKERS: "2"
+      QC_SCHEDULER_WORKERS: "2"
     volumes:
       - wafer-data:/data
     restart: unless-stopped

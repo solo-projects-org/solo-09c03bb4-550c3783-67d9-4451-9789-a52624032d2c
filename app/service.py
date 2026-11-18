@@ -17,6 +17,7 @@ accepted snapshot.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 import uuid
@@ -26,10 +27,12 @@ from typing import Any, Literal
 from .db import connect, read_snapshot, transaction, utcnow
 from .errors import DomainError
 from .mapping import LocalMeasurement, MappedMeasurement, map_local_to_full
-from .schemas import BatchInfo, BatchRequest, WaferSummary
+from .schemas import BatchInfo, BatchRequest, QcSubmitRequest, WaferSummary
 
 MAX_REPORTED_OFFENDING_CELLS = 50
 MAX_DENSE_CELLS = 250_000
+MAX_QC_FINDINGS_PER_CATEGORY = 500
+MAX_QC_NUMBERS_PER_CELL = 50
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,25 @@ class Snapshot:
     rows: int
     cols: int
     cells: list[sqlite3.Row]
+
+
+@dataclass(frozen=True)
+class QcSnapshot:
+    """A consistent view of one pending checklist and the data it covers.
+
+    ``obs_seq``/``map_seq`` are the wafer's accepted/committed sequences at
+    the moment the rows were read; the conclusion may only be published while
+    they are still the live values.
+    """
+
+    check_id: str
+    wafer_id: str
+    revision: int
+    obs_seq: int
+    map_seq: int
+    items: list[sqlite3.Row]
+    observations: list[sqlite3.Row]
+    map_cells: list[sqlite3.Row]
 
 
 WaferStatus = Literal["empty", "pending_update", "ready"]
@@ -84,12 +106,17 @@ class WaferService:
         *,
         recompute_delay_seconds: float = 0.0,
         max_recompute_rounds: int = 10,
+        qc_delay_seconds: float = 0.0,
+        max_qc_rounds: int = 10,
     ) -> None:
         self.db_path = db_path
         # Test hook: widens the window between snapshot and publication so a
         # competing acceptance can be interleaved deterministically.
         self.recompute_delay_seconds = recompute_delay_seconds
         self.max_recompute_rounds = max_recompute_rounds
+        # Same kind of test hook for the retest-QC verification path.
+        self.qc_delay_seconds = qc_delay_seconds
+        self.max_qc_rounds = max_qc_rounds
 
     # ------------------------------------------------------------------ accept
     def accept_batch(self, wafer_id: str, request: BatchRequest) -> dict[str, Any]:
@@ -689,6 +716,481 @@ class WaferService:
             conn.close()
         return [row["wafer_id"] for row in rows]
 
+    # ------------------------------------------------------------- retest QC
+    # A checklist submission starts a new per-wafer ``revision`` and a
+    # background verification.  The published conclusion stays valid only
+    # while (revision, obs_seq, map_seq) still match the wafer's live
+    # counters, so both a resubmitted checklist and a newly accepted batch
+    # invalidate the old release *immediately*, without touching its row.
+    def submit_qc_check(self, wafer_id: str, request: QcSubmitRequest) -> dict[str, Any]:
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn, immediate=True):
+                wafer = self._wafer_or_404(conn, wafer_id)
+                self._reject_qc_out_of_bounds(wafer, request.items)
+                previous_release = self._current_release_locked(conn, wafer_id)
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(revision), 0) AS rev "
+                    "FROM qc_checks WHERE wafer_id = ?",
+                    (wafer_id,),
+                ).fetchone()
+                revision = int(row["rev"]) + 1
+                now = utcnow()
+                # A resubmitted checklist supersedes whatever was still
+                # waiting; a superseded check can never publish again.
+                conn.execute(
+                    """
+                    UPDATE qc_checks
+                       SET status = 'superseded', updated_at = ?
+                     WHERE wafer_id = ? AND status = 'pending'
+                    """,
+                    (now, wafer_id),
+                )
+                check_id = uuid.uuid4().hex
+                conn.execute(
+                    """
+                    INSERT INTO qc_checks (
+                        check_id, wafer_id, revision, status, item_count,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (check_id, wafer_id, revision, len(request.items), now, now),
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO qc_check_items (
+                        check_id, full_row, full_col, expected_max_retest_no
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (check_id, item.row, item.col, item.expected_max_retest_no)
+                        for item in request.items
+                    ],
+                )
+        finally:
+            conn.close()
+
+        return {
+            "wafer_id": wafer_id,
+            "check_id": check_id,
+            "revision": revision,
+            "status": "pending",
+            "item_count": len(request.items),
+            "previous_release_invalidated": previous_release is not None,
+        }
+
+    def _reject_qc_out_of_bounds(
+        self, wafer: sqlite3.Row, items: list[Any]
+    ) -> None:
+        rows, cols = int(wafer["rows"]), int(wafer["cols"])
+        offending = [
+            item
+            for item in items
+            if not (0 <= item.row < rows and 0 <= item.col < cols)
+        ]
+        if not offending:
+            return
+        raise DomainError(
+            422,
+            "QC_CELL_OUT_OF_BOUNDS",
+            (
+                f"checklist rejected: {len(offending)} position(s) fall outside "
+                f"the {rows}x{cols} wafer"
+            ),
+            {
+                "offending_count": len(offending),
+                "examples": [
+                    {"row": item.row, "col": item.col}
+                    for item in offending[:MAX_REPORTED_OFFENDING_CELLS]
+                ],
+            },
+        )
+
+    def _current_release_locked(
+        self, conn: sqlite3.Connection, wafer_id: str
+    ) -> sqlite3.Row | None:
+        """The completed check whose conclusion is still the live release."""
+        return conn.execute(
+            """
+            SELECT c.* FROM qc_checks AS c
+              JOIN wafers AS w ON w.wafer_id = c.wafer_id
+             WHERE c.wafer_id = ?
+               AND c.status = 'completed'
+               AND c.revision = (
+                       SELECT MAX(revision) FROM qc_checks WHERE wafer_id = ?
+                   )
+               AND c.obs_seq = w.accepted_seq
+               AND c.map_seq = w.committed_seq
+            """,
+            (wafer_id, wafer_id),
+        ).fetchone()
+
+    def get_qc_check(self, wafer_id: str, check_id: str) -> dict[str, Any]:
+        conn = connect(self.db_path)
+        try:
+            with read_snapshot(conn):
+                self._wafer_or_404(conn, wafer_id)
+                check = conn.execute(
+                    "SELECT * FROM qc_checks WHERE check_id = ? AND wafer_id = ?",
+                    (check_id, wafer_id),
+                ).fetchone()
+                if check is None:
+                    raise DomainError(
+                        404,
+                        "QC_CHECK_NOT_FOUND",
+                        f"wafer {wafer_id!r} has no retest QC check {check_id!r}",
+                    )
+                return self._qc_payload(conn, check)
+        finally:
+            conn.close()
+
+    def get_latest_qc_check(self, wafer_id: str) -> dict[str, Any]:
+        conn = connect(self.db_path)
+        try:
+            with read_snapshot(conn):
+                self._wafer_or_404(conn, wafer_id)
+                check = conn.execute(
+                    """
+                    SELECT * FROM qc_checks
+                     WHERE wafer_id = ?
+                     ORDER BY revision DESC
+                     LIMIT 1
+                    """,
+                    (wafer_id,),
+                ).fetchone()
+                if check is None:
+                    raise DomainError(
+                        404,
+                        "QC_CHECK_NOT_FOUND",
+                        f"wafer {wafer_id!r} has no retest QC checklist yet",
+                    )
+                return self._qc_payload(conn, check)
+        finally:
+            conn.close()
+
+    def _qc_payload(
+        self, conn: sqlite3.Connection, check: sqlite3.Row
+    ) -> dict[str, Any]:
+        wafer = self._wafer_or_404(conn, check["wafer_id"])
+        latest_revision = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) AS rev "
+                "FROM qc_checks WHERE wafer_id = ?",
+                (check["wafer_id"],),
+            ).fetchone()["rev"]
+        )
+        # The release is valid only while checklist, observations and map all
+        # still sit at the revision the conclusion was verified against.
+        release_valid = (
+            check["status"] == "completed"
+            and int(check["revision"]) == latest_revision
+            and check["obs_seq"] is not None
+            and int(check["obs_seq"]) == int(wafer["accepted_seq"])
+            and int(check["map_seq"]) == int(wafer["committed_seq"])
+        )
+        last_error = None
+        if check["last_error"] is not None:
+            last_error = {
+                "message": check["last_error"],
+                "at": check["last_error_at"],
+            }
+        return {
+            "wafer_id": check["wafer_id"],
+            "check_id": check["check_id"],
+            "revision": check["revision"],
+            "status": check["status"],
+            "conclusion": check["conclusion"],
+            "release_valid": release_valid,
+            "item_count": check["item_count"],
+            "obs_seq": check["obs_seq"],
+            "map_seq": check["map_seq"],
+            "current_accepted_seq": wafer["accepted_seq"],
+            "current_map_seq": wafer["committed_seq"],
+            "attempts": check["attempts"],
+            "last_error": last_error,
+            "findings": json.loads(check["findings"]) if check["findings"] else None,
+            "summary": json.loads(check["summary"]) if check["summary"] else None,
+            "created_at": check["created_at"],
+            "updated_at": check["updated_at"],
+            "completed_at": check["completed_at"],
+        }
+
+    def retry_qc_check(self, wafer_id: str, check_id: str) -> None:
+        """Re-arm a pending check (after a failure or restart) for scheduling."""
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn, immediate=True):
+                self._wafer_or_404(conn, wafer_id)
+                check = conn.execute(
+                    "SELECT * FROM qc_checks WHERE check_id = ? AND wafer_id = ?",
+                    (check_id, wafer_id),
+                ).fetchone()
+                if check is None:
+                    raise DomainError(
+                        404,
+                        "QC_CHECK_NOT_FOUND",
+                        f"wafer {wafer_id!r} has no retest QC check {check_id!r}",
+                    )
+                if check["status"] != "pending":
+                    raise DomainError(
+                        409,
+                        "QC_CHECK_NOT_PENDING",
+                        (
+                            f"check {check_id!r} is {check['status']}; only a "
+                            "pending check can be retried (resubmit the "
+                            "checklist to supersede a finished one)"
+                        ),
+                        {"status": check["status"]},
+                    )
+                conn.execute(
+                    """
+                    UPDATE qc_checks
+                       SET last_error = NULL, last_error_at = NULL, updated_at = ?
+                     WHERE check_id = ?
+                    """,
+                    (utcnow(), check_id),
+                )
+        finally:
+            conn.close()
+
+    def pending_qc_check_ids(self) -> list[str]:
+        conn = connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT check_id FROM qc_checks WHERE status = 'pending' "
+                "ORDER BY created_at"
+            ).fetchall()
+        finally:
+            conn.close()
+        return [row["check_id"] for row in rows]
+
+    def run_qc_check(self, check_id: str) -> None:
+        """Verify one pending checklist and publish its conclusion.
+
+        A conclusion is published only while the checklist is still the
+        latest revision and the snapshot's sequences are still the live ones;
+        anything else is discarded and re-verified, so a late verification
+        can never resurrect superseded data or an old release.
+        """
+        self._mark_qc_attempt(check_id)
+        for _ in range(self.max_qc_rounds):
+            try:
+                snapshot = self._build_qc_snapshot(check_id)
+            except Exception as exc:
+                self.record_qc_failure(check_id, str(exc))
+                raise
+            if snapshot is None:
+                return  # superseded, completed or removed while scheduled
+            if snapshot.map_seq != snapshot.obs_seq:
+                # Map and observations must describe the same revision before
+                # any conclusion may be published: bring the map up to date.
+                try:
+                    self.recompute(snapshot.wafer_id)
+                except Exception as exc:
+                    self.record_qc_failure(check_id, str(exc))
+                    raise
+                continue
+            if self.qc_delay_seconds:
+                time.sleep(self.qc_delay_seconds)
+            conclusion, findings, summary = _evaluate_qc_snapshot(snapshot)
+            try:
+                outcome = self._publish_qc(snapshot, conclusion, findings, summary)
+            except Exception as exc:
+                self.record_qc_failure(check_id, str(exc))
+                raise
+            if outcome == "stale":
+                continue
+            return  # published or superseded
+        # Data kept changing faster than we could verify: the check stays
+        # pending and can be retried explicitly.
+
+    def _mark_qc_attempt(self, check_id: str) -> None:
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn, immediate=True):
+                conn.execute(
+                    """
+                    UPDATE qc_checks
+                       SET attempts = attempts + 1, updated_at = ?
+                     WHERE check_id = ? AND status = 'pending'
+                    """,
+                    (utcnow(), check_id),
+                )
+        finally:
+            conn.close()
+
+    def _build_qc_snapshot(self, check_id: str) -> QcSnapshot | None:
+        conn = connect(self.db_path)
+        try:
+            check = conn.execute(
+                "SELECT * FROM qc_checks WHERE check_id = ?", (check_id,)
+            ).fetchone()
+            if check is None or check["status"] != "pending":
+                return None
+            items = conn.execute(
+                """
+                SELECT full_row, full_col, expected_max_retest_no
+                  FROM qc_check_items
+                 WHERE check_id = ?
+                 ORDER BY full_row, full_col
+                """,
+                (check_id,),
+            ).fetchall()
+            # The item list drives joins against observations and the map.
+            # It is connection-local and immutable for this check.
+            conn.execute("DROP TABLE IF EXISTS temp._qc_items")
+            conn.execute(
+                """
+                CREATE TEMP TABLE _qc_items (
+                    full_row INTEGER NOT NULL,
+                    full_col  INTEGER NOT NULL,
+                    PRIMARY KEY (full_row, full_col)
+                )
+                """
+            )
+            try:
+                conn.executemany(
+                    "INSERT INTO temp._qc_items (full_row, full_col) VALUES (?, ?)",
+                    [(item["full_row"], item["full_col"]) for item in items],
+                )
+                # One read transaction: sequences, observations and map cells
+                # all come from the same database snapshot.
+                with read_snapshot(conn):
+                    wafer = self._wafer_or_404(conn, check["wafer_id"])
+                    observations = conn.execute(
+                        """
+                        SELECT o.full_row, o.full_col, o.retest_no, o.verdict,
+                               o.machine_id, o.batch_id, o.local_row, o.local_col
+                          FROM observations AS o
+                          JOIN temp._qc_items AS i
+                            ON i.full_row = o.full_row AND i.full_col = o.full_col
+                         WHERE o.wafer_id = ?
+                         ORDER BY o.full_row, o.full_col, o.retest_no
+                        """,
+                        (check["wafer_id"],),
+                    ).fetchall()
+                    map_cells = conn.execute(
+                        """
+                        SELECT m.full_row, m.full_col, m.verdict,
+                               m.source_retest_no, m.source_machine_id,
+                               m.source_batch_id, m.source_local_row,
+                               m.source_local_col
+                          FROM map_cells AS m
+                          JOIN temp._qc_items AS i
+                            ON i.full_row = m.full_row AND i.full_col = m.full_col
+                         WHERE m.wafer_id = ?
+                        """,
+                        (check["wafer_id"],),
+                    ).fetchall()
+            finally:
+                conn.execute("DROP TABLE IF EXISTS temp._qc_items")
+            return QcSnapshot(
+                check_id=check_id,
+                wafer_id=check["wafer_id"],
+                revision=int(check["revision"]),
+                obs_seq=int(wafer["accepted_seq"]),
+                map_seq=int(wafer["committed_seq"]),
+                items=items,
+                observations=observations,
+                map_cells=map_cells,
+            )
+        finally:
+            conn.close()
+
+    def _publish_qc(
+        self,
+        snapshot: QcSnapshot,
+        conclusion: str,
+        findings: dict[str, Any],
+        summary: dict[str, Any],
+    ) -> str:
+        """Publish a conclusion; returns 'published', 'stale' or 'superseded'."""
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn, immediate=True):
+                check = conn.execute(
+                    "SELECT * FROM qc_checks WHERE check_id = ?",
+                    (snapshot.check_id,),
+                ).fetchone()
+                if check is None or check["status"] != "pending":
+                    return "superseded"
+                wafer = conn.execute(
+                    "SELECT accepted_seq, committed_seq FROM wafers WHERE wafer_id = ?",
+                    (snapshot.wafer_id,),
+                ).fetchone()
+                if wafer is None:
+                    raise DomainError(
+                        404,
+                        "WAFER_NOT_FOUND",
+                        f"wafer {snapshot.wafer_id!r} was removed",
+                    )
+                if (
+                    int(wafer["accepted_seq"]) != snapshot.obs_seq
+                    or int(wafer["committed_seq"]) != snapshot.map_seq
+                ):
+                    # New measurements (or a newer map) landed while we were
+                    # verifying: this conclusion is stale, discard it.
+                    return "stale"
+                latest = conn.execute(
+                    "SELECT COALESCE(MAX(revision), 0) AS rev "
+                    "FROM qc_checks WHERE wafer_id = ?",
+                    (snapshot.wafer_id,),
+                ).fetchone()
+                now = utcnow()
+                if int(latest["rev"]) != snapshot.revision:
+                    # A newer checklist was submitted in the meantime.
+                    conn.execute(
+                        "UPDATE qc_checks SET status = 'superseded', "
+                        "updated_at = ? WHERE check_id = ?",
+                        (now, snapshot.check_id),
+                    )
+                    return "superseded"
+                conn.execute(
+                    """
+                    UPDATE qc_checks
+                       SET status = 'completed', conclusion = ?, findings = ?,
+                           summary = ?, obs_seq = ?, map_seq = ?,
+                           completed_at = ?, updated_at = ?,
+                           last_error = NULL, last_error_at = NULL
+                     WHERE check_id = ?
+                    """,
+                    (
+                        conclusion,
+                        json.dumps(findings),
+                        json.dumps(summary),
+                        snapshot.obs_seq,
+                        snapshot.map_seq,
+                        now,
+                        now,
+                        snapshot.check_id,
+                    ),
+                )
+                return "published"
+        finally:
+            conn.close()
+
+    def record_qc_failure(self, check_id: str, message: str) -> None:
+        """Persist a failed verification attempt; the check stays pending."""
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn, immediate=True):
+                check = conn.execute(
+                    "SELECT status FROM qc_checks WHERE check_id = ?", (check_id,)
+                ).fetchone()
+                if check is None or check["status"] != "pending":
+                    return
+                now = utcnow()
+                conn.execute(
+                    """
+                    UPDATE qc_checks
+                       SET last_error = ?, last_error_at = ?, updated_at = ?
+                     WHERE check_id = ?
+                    """,
+                    (message[:2000], now, now, check_id),
+                )
+        finally:
+            conn.close()
+
     @staticmethod
     def _wafer_or_404(conn: sqlite3.Connection, wafer_id: str) -> sqlite3.Row:
         row = conn.execute(
@@ -715,3 +1217,144 @@ def _cell_payload(cell: sqlite3.Row) -> dict[str, Any]:
             "local_col": cell["source_local_col"],
         },
     }
+
+
+def _evaluate_qc_snapshot(
+    snapshot: QcSnapshot,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Compare one checklist against its snapshot.
+
+    For every position the accepted records must run continuously from 0 to
+    the expected highest retest number (no 缺号), contain nothing above it
+    (no 超号), and the published map's highest retest number and source must
+    correspond to those records (no 地图不一致).  Returns the conclusion, the
+    (capped) findings and the exact summary counts.
+    """
+    observations: dict[tuple[int, int], dict[int, sqlite3.Row]] = {}
+    for row in snapshot.observations:
+        observations.setdefault((row["full_row"], row["full_col"]), {})[
+            row["retest_no"]
+        ] = row
+    map_by_cell = {
+        (cell["full_row"], cell["full_col"]): cell for cell in snapshot.map_cells
+    }
+
+    missing: list[dict[str, Any]] = []
+    exceeded: list[dict[str, Any]] = []
+    inconsistent: list[dict[str, Any]] = []
+    cells_missing = 0
+    cells_exceeded = 0
+    cells_inconsistent = 0
+    truncated = False
+
+    for item in snapshot.items:
+        position = (item["full_row"], item["full_col"])
+        expected = int(item["expected_max_retest_no"])
+        observed = observations.get(position, {})
+
+        # --- continuity: every number in 0..expected must be accepted
+        observed_within = sum(1 for number in observed if number <= expected)
+        missing_count = expected + 1 - observed_within
+        if missing_count:
+            cells_missing += 1
+            if len(missing) < MAX_QC_FINDINGS_PER_CATEGORY:
+                reported: list[int] = []
+                number = 0
+                while (
+                    len(reported) < MAX_QC_NUMBERS_PER_CELL
+                    and len(reported) < missing_count
+                ):
+                    if number not in observed:
+                        reported.append(number)
+                    number += 1
+                missing.append(
+                    {
+                        "row": position[0],
+                        "col": position[1],
+                        "expected_max_retest_no": expected,
+                        "missing_count": missing_count,
+                        "missing_retest_nos": reported,
+                        "truncated": missing_count > len(reported),
+                    }
+                )
+            else:
+                truncated = True
+
+        # --- excess: nothing above the expected number may exist
+        extra = sorted(number for number in observed if number > expected)
+        if extra:
+            cells_exceeded += 1
+            if len(exceeded) < MAX_QC_FINDINGS_PER_CATEGORY:
+                reported_extra = extra[:MAX_QC_NUMBERS_PER_CELL]
+                exceeded.append(
+                    {
+                        "row": position[0],
+                        "col": position[1],
+                        "expected_max_retest_no": expected,
+                        "extra_count": len(extra),
+                        "extra_retest_nos": reported_extra,
+                        "truncated": len(extra) > len(reported_extra),
+                    }
+                )
+            else:
+                truncated = True
+
+        # --- map consistency: the published map must reflect these records
+        map_cell = map_by_cell.get(position)
+        observed_max = max(observed) if observed else None
+        reason: str | None = None
+        if observed:
+            if map_cell is None:
+                reason = "map_missing_cell"
+            elif int(map_cell["source_retest_no"]) != observed_max:
+                reason = "map_retest_mismatch"
+            else:
+                winner = observed[observed_max]
+                if (
+                    map_cell["verdict"] != winner["verdict"]
+                    or map_cell["source_machine_id"] != winner["machine_id"]
+                    or map_cell["source_batch_id"] != winner["batch_id"]
+                    or int(map_cell["source_local_row"]) != int(winner["local_row"])
+                    or int(map_cell["source_local_col"]) != int(winner["local_col"])
+                ):
+                    reason = "map_source_mismatch"
+        elif map_cell is not None:
+            reason = "map_without_observation"
+        if reason is not None:
+            cells_inconsistent += 1
+            if len(inconsistent) < MAX_QC_FINDINGS_PER_CATEGORY:
+                inconsistent.append(
+                    {
+                        "row": position[0],
+                        "col": position[1],
+                        "expected_max_retest_no": expected,
+                        "reason": reason,
+                        "observed_max_retest_no": observed_max,
+                        "map_retest_no": (
+                            int(map_cell["source_retest_no"])
+                            if map_cell is not None
+                            else None
+                        ),
+                    }
+                )
+            else:
+                truncated = True
+
+    conclusion = (
+        "releasable"
+        if not (cells_missing or cells_exceeded or cells_inconsistent)
+        else "not_releasable"
+    )
+    findings = {
+        "missing": missing,
+        "exceeded": exceeded,
+        "map_inconsistent": inconsistent,
+    }
+    summary = {
+        "item_count": len(snapshot.items),
+        "cells_with_missing": cells_missing,
+        "cells_with_exceeded": cells_exceeded,
+        "cells_with_map_inconsistency": cells_inconsistent,
+        "findings_truncated": truncated,
+    }
+    return conclusion, findings, summary

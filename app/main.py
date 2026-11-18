@@ -15,15 +15,19 @@ from fastapi.responses import JSONResponse
 
 from .db import init_db
 from .errors import DomainError
-from .scheduler import RecomputeScheduler
+from .scheduler import QcScheduler, RecomputeScheduler
 from .schemas import (
     BatchAcceptedResponse,
     BatchListResponse,
     BatchRequest,
     CellLookupResponse,
+    CheckId,
     ErrorResponse,
     HealthResponse,
     MapResponse,
+    QcCheckAcceptedResponse,
+    QcCheckResponse,
+    QcSubmitRequest,
     RecomputeResponse,
     WaferId,
     WaferListResponse,
@@ -42,6 +46,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 class Settings:
     db_path: str = "data/wafer.db"
     scheduler_workers: int = 2
+    qc_scheduler_workers: int = 2
     recompute_delay_seconds: float = 0.0
 
     @classmethod
@@ -49,6 +54,7 @@ class Settings:
         return cls(
             db_path=os.getenv("WAFER_DB_PATH", "data/wafer.db"),
             scheduler_workers=_int_env("SCHEDULER_WORKERS", 2),
+            qc_scheduler_workers=_int_env("QC_SCHEDULER_WORKERS", 2),
             recompute_delay_seconds=float(os.getenv("RECOMPUTE_DELAY_SECONDS", "0")),
         )
 
@@ -71,14 +77,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler = app.state.scheduler or RecomputeScheduler(
         service, workers=settings.scheduler_workers
     )
+    qc_scheduler = app.state.qc_scheduler or QcScheduler(
+        service, workers=settings.qc_scheduler_workers
+    )
     app.state.service = service
     app.state.scheduler = scheduler
+    app.state.qc_scheduler = qc_scheduler
     # Interrupted work is resumed from persisted state, never from memory.
     scheduler.recover_pending()
+    qc_scheduler.recover_pending()
     try:
         yield
     finally:
         scheduler.shutdown(wait=True)
+        qc_scheduler.shutdown(wait=True)
 
 
 def create_app(
@@ -86,21 +98,28 @@ def create_app(
     *,
     service: WaferService | None = None,
     scheduler: RecomputeScheduler | None = None,
+    qc_scheduler: QcScheduler | None = None,
 ) -> FastAPI:
     app = FastAPI(
         title="Wafer Probe Map Merger",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Merge rotated local probe-machine grids into one full-wafer map. "
             "Highest retest number wins per position; untested positions stay blank. "
             "Conflicting verdicts for the same position and retest number reject the "
-            "whole batch and preserve the previous map."
+            "whole batch and preserve the previous map. "
+            "A retest-chain QC checklist verifies per position that accepted "
+            "records run continuously from 0 to the expected highest retest "
+            "number, that nothing higher exists, and that the published map "
+            "matches those records; the release it publishes stays valid only "
+            "until the next upload or checklist submission."
         ),
         lifespan=_lifespan,
     )
     app.state.settings = settings or Settings.from_env()
     app.state.service = service
     app.state.scheduler = scheduler
+    app.state.qc_scheduler = qc_scheduler
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(_: Request, exc: DomainError) -> JSONResponse:
@@ -135,6 +154,9 @@ def create_app(
 
     def sched(request: Request) -> RecomputeScheduler:
         return request.app.state.scheduler
+
+    def qsched(request: Request) -> QcScheduler:
+        return request.app.state.qc_scheduler
 
     @app.get("/healthz", response_model=HealthResponse, tags=["system"])
     def healthz() -> HealthResponse:
@@ -233,6 +255,85 @@ def create_app(
         return RecomputeResponse(
             **svc(request).recompute_status(wafer_id, scheduled=True)
         )
+
+    @app.post(
+        "/wafers/{wafer_id}/retest-qc",
+        response_model=QcCheckAcceptedResponse,
+        status_code=202,
+        tags=["retest-qc"],
+        summary="Submit a retest-chain QC checklist",
+        description=(
+            "Verify per position that accepted records run continuously from "
+            "0 to the expected highest retest number, that no higher number "
+            "exists, and that the published map matches those records. "
+            "Submitting immediately invalidates the previous release; the "
+            "conclusion is published asynchronously once map, observations "
+            "and checklist are on the same current revision."
+        ),
+        responses={
+            404: {"model": ErrorResponse, "description": "Wafer not found"},
+            422: {
+                "model": ErrorResponse,
+                "description": "Invalid payload or checklist positions outside the wafer",
+            },
+        },
+    )
+    def submit_retest_qc(
+        wafer_id: WaferId,
+        payload: QcSubmitRequest,
+        request: Request,
+    ) -> QcCheckAcceptedResponse:
+        result = svc(request).submit_qc_check(wafer_id, payload)
+        qsched(request).submit(result["check_id"])
+        return QcCheckAcceptedResponse(scheduled=True, **result)
+
+    @app.get(
+        "/wafers/{wafer_id}/retest-qc/latest",
+        response_model=QcCheckResponse,
+        tags=["retest-qc"],
+        summary="Latest checklist and whether its release is still valid",
+        responses={
+            404: {
+                "model": ErrorResponse,
+                "description": "Wafer not found or no checklist submitted yet",
+            }
+        },
+    )
+    def latest_retest_qc(wafer_id: WaferId, request: Request) -> QcCheckResponse:
+        return QcCheckResponse(**svc(request).get_latest_qc_check(wafer_id))
+
+    @app.get(
+        "/wafers/{wafer_id}/retest-qc/{check_id}",
+        response_model=QcCheckResponse,
+        tags=["retest-qc"],
+        summary="One checklist with findings, conclusion and live validity",
+        responses={404: {"model": ErrorResponse, "description": "Wafer or check not found"}},
+    )
+    def get_retest_qc(
+        wafer_id: WaferId, check_id: CheckId, request: Request
+    ) -> QcCheckResponse:
+        return QcCheckResponse(**svc(request).get_qc_check(wafer_id, check_id))
+
+    @app.post(
+        "/wafers/{wafer_id}/retest-qc/{check_id}/retry",
+        response_model=QcCheckResponse,
+        status_code=202,
+        tags=["retest-qc"],
+        summary="Retry a pending checklist that failed or was interrupted",
+        responses={
+            404: {"model": ErrorResponse, "description": "Wafer or check not found"},
+            409: {
+                "model": ErrorResponse,
+                "description": "Check is no longer pending",
+            },
+        },
+    )
+    def retry_retest_qc(
+        wafer_id: WaferId, check_id: CheckId, request: Request
+    ) -> QcCheckResponse:
+        svc(request).retry_qc_check(wafer_id, check_id)
+        qsched(request).submit(check_id)
+        return QcCheckResponse(**svc(request).get_qc_check(wafer_id, check_id))
 
     @app.get(
         "/wafers",

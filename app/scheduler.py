@@ -85,3 +85,68 @@ class RecomputeScheduler:
         with self._lock:
             self._closed = True
         self._executor.shutdown(wait=wait)
+
+
+class QcScheduler:
+    """Background runner for retest-chain QC checks.
+
+    Same discipline as :class:`RecomputeScheduler`: at most one run per check
+    in flight, extra submits collapse into a rerun flag, and checks that were
+    pending when the process stopped are recovered from the database — the
+    sequence/revision guards in ``WaferService._publish_qc`` decide what may
+    actually be published.
+    """
+
+    def __init__(self, service: WaferService, *, workers: int = 2) -> None:
+        self._service = service
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, workers), thread_name_prefix="retest-qc"
+        )
+        self._lock = threading.Lock()
+        self._inflight: set[str] = set()
+        self._rerun: set[str] = set()
+        self._closed = False
+
+    def submit(self, check_id: str) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            if check_id in self._inflight:
+                self._rerun.add(check_id)
+                return
+            self._inflight.add(check_id)
+        try:
+            self._executor.submit(self._run, check_id)
+        except RuntimeError:  # executor already shut down
+            with self._lock:
+                self._inflight.discard(check_id)
+
+    def _run(self, check_id: str) -> None:
+        try:
+            while True:
+                try:
+                    self._service.run_qc_check(check_id)
+                except Exception:
+                    # The failure is persisted on the check row, which stays
+                    # pending and can be retried explicitly.
+                    logger.exception("retest QC check %s failed", check_id)
+                with self._lock:
+                    if check_id in self._rerun and not self._closed:
+                        self._rerun.discard(check_id)
+                        continue
+                    self._inflight.discard(check_id)
+                    return
+        finally:
+            # Never leave the check wedged if something unexpected propagated.
+            with self._lock:
+                self._inflight.discard(check_id)
+
+    def recover_pending(self) -> None:
+        """Requeue checks that were pending when the process stopped."""
+        for check_id in self._service.pending_qc_check_ids():
+            self.submit(check_id)
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        with self._lock:
+            self._closed = True
+        self._executor.shutdown(wait=wait)

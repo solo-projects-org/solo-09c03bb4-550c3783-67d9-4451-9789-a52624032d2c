@@ -11,8 +11,16 @@ MAX_WAFER_DIM = 2000
 MAX_LOCAL_DIM = 2000
 MAX_CELLS = 250_000
 MAX_RETEST_NO = 1_000_000_000
+MAX_QC_ITEMS = 250_000
 
 WaferId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True, min_length=1, max_length=64, pattern=ID_PATTERN
+    ),
+]
+
+CheckId = Annotated[
     str,
     StringConstraints(
         strip_whitespace=True, min_length=1, max_length=64, pattern=ID_PATTERN
@@ -229,3 +237,178 @@ class RecomputeResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: Literal["ok"]
     database: str
+
+
+# ------------------------------------------------------------- retest QC
+class QcItem(BaseModel):
+    """One checklist entry: a wafer position and the highest retest number
+    it should have completed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    row: int = Field(ge=0, description="Zero-based full-wafer row.")
+    col: int = Field(ge=0, description="Zero-based full-wafer column.")
+    expected_max_retest_no: int = Field(
+        ge=0,
+        le=MAX_RETEST_NO,
+        description=(
+            "Highest retest number this position should have completed. "
+            "Accepted records must then cover every number from 0 up to and "
+            "including this one, and nothing higher."
+        ),
+        examples=[2],
+    )
+
+
+class QcSubmitRequest(BaseModel):
+    """A retest-chain QC checklist. Submitting it immediately invalidates the
+    previous release for the wafer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[QcItem] = Field(
+        min_length=1,
+        max_length=MAX_QC_ITEMS,
+        description="Non-empty checklist of positions to verify.",
+    )
+
+    @model_validator(mode="after")
+    def _no_duplicate_positions(self) -> "QcSubmitRequest":
+        seen: set[tuple[int, int]] = set()
+        for item in self.items:
+            position = (item.row, item.col)
+            if position in seen:
+                raise ValueError(
+                    f"duplicate checklist position ({item.row}, {item.col})"
+                )
+            seen.add(position)
+        return self
+
+
+class QcMissingFinding(BaseModel):
+    row: int
+    col: int
+    expected_max_retest_no: int
+    missing_count: int = Field(
+        description="How many retest numbers in 0..expected are absent."
+    )
+    missing_retest_nos: list[int] = Field(
+        description="The absent numbers, truncated to 50 per cell."
+    )
+    truncated: bool
+
+
+class QcExceededFinding(BaseModel):
+    row: int
+    col: int
+    expected_max_retest_no: int
+    extra_count: int = Field(
+        description="How many accepted retest numbers exceed the expected one."
+    )
+    extra_retest_nos: list[int] = Field(
+        description="The exceeding numbers, truncated to 50 per cell."
+    )
+    truncated: bool
+
+
+class QcMapInconsistencyFinding(BaseModel):
+    row: int
+    col: int
+    expected_max_retest_no: int
+    reason: Literal[
+        "map_missing_cell",
+        "map_retest_mismatch",
+        "map_source_mismatch",
+        "map_without_observation",
+    ]
+    observed_max_retest_no: int | None = Field(
+        description="Highest retest number in the accepted records, if any."
+    )
+    map_retest_no: int | None = Field(
+        description="Retest number the published map currently shows, if any."
+    )
+
+
+class QcFindings(BaseModel):
+    """Problem coordinates, grouped by defect. Each list is capped at 500
+    entries; the summary always carries exact totals."""
+
+    missing: list[QcMissingFinding] = Field(
+        description="Positions whose accepted records are not continuous 0..N."
+    )
+    exceeded: list[QcExceededFinding] = Field(
+        description="Positions with accepted retest numbers above N."
+    )
+    map_inconsistent: list[QcMapInconsistencyFinding] = Field(
+        description="Positions where the published map does not match the accepted records."
+    )
+
+
+class QcSummary(BaseModel):
+    item_count: int
+    cells_with_missing: int
+    cells_with_exceeded: int
+    cells_with_map_inconsistency: int
+    findings_truncated: bool = Field(
+        description="True when a findings list was capped; totals stay exact."
+    )
+
+
+class QcCheckError(BaseModel):
+    message: str
+    at: str
+
+
+class QcCheckAcceptedResponse(BaseModel):
+    wafer_id: str
+    check_id: str
+    revision: int = Field(
+        description="Per-wafer checklist revision. A resubmission bumps it."
+    )
+    status: Literal["pending"] = "pending"
+    item_count: int
+    previous_release_invalidated: bool = Field(
+        description=(
+            "True when a still-valid release existed just before this "
+            "submission and is now invalid."
+        )
+    )
+    scheduled: bool
+
+
+class QcCheckResponse(BaseModel):
+    wafer_id: str
+    check_id: str
+    revision: int
+    status: Literal["pending", "completed", "superseded"] = Field(
+        description=(
+            "pending: verification not (successfully) finished yet, safe to "
+            "retry. superseded: a newer checklist replaced this one."
+        )
+    )
+    conclusion: Literal["releasable", "not_releasable"] | None = Field(
+        description="Published verdict of the checklist; null while pending."
+    )
+    release_valid: bool = Field(
+        description=(
+            "True only while this check is the latest revision AND no new "
+            "measurements were accepted AND the published map still matches "
+            "the revision the conclusion was built from."
+        )
+    )
+    item_count: int
+    obs_seq: int | None = Field(
+        description="Accepted sequence the conclusion was verified against."
+    )
+    map_seq: int | None = Field(
+        description="Published-map sequence the conclusion was verified against."
+    )
+    current_accepted_seq: int = Field(description="Live accepted sequence.")
+    current_map_seq: int = Field(description="Live published-map sequence.")
+    attempts: int = Field(description="How many verification runs were started.")
+    last_error: QcCheckError | None = None
+    findings: QcFindings | None = None
+    summary: QcSummary | None = None
+    created_at: str
+    updated_at: str
+    completed_at: str | None = None
